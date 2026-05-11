@@ -32,9 +32,12 @@ The current answer is scoped but real:
 | `qwen_cl_desiderata_audit.py` | Focused Qwen no-proxy continual-learning audit: adapter acquisition, Amoeba consolidation, projection, LSP composition branches. |
 | `qwen_continual_proof.py` | Earlier large Qwen pipeline with staged synthetic skills, consolidation, composition, and expansion experiments. |
 | `gemma_cl_desiderata_audit.py` | Cross-family Gemma 270M no-proxy audit with Gemma-calibrated task interface. |
+| `gsm8k_sdft_baseline_audit.py` | GSM8K -> Sort retention/acquisition comparison against naive SFT and SDFT-style baseline. |
+| `qwen_z_law_controller_audit.py` | Qwen Z-law / Z-guided expansion audit for conflict pressure and adaptive capacity growth. |
 | `qwen_tomography.py` | Layerwise activation/gradient SVD profiles, occupied bases, pressure scoring, layer selection, saturation reports. |
 | `standalone_latent_lora_qwen.py` | Shared model loading, latent adapter, LoRA-style modules, schedules, and utility code. |
 | `EXPERIMENTS.md` | Human-readable experiment summaries and safest public claims. |
+| `toy/` | Prototype mechanism experiments behind Amoeba, LSP, expansion, Z-law control, and verifier/self-acquisition. |
 
 ## Quick Sanity Check
 
@@ -47,6 +50,8 @@ python -m py_compile \
   qwen_continual_proof.py \
   qwen_cl_desiderata_audit.py \
   gemma_cl_desiderata_audit.py \
+  gsm8k_sdft_baseline_audit.py \
+  qwen_z_law_controller_audit.py \
   alien_ladder_cl_audit.py
 ```
 
