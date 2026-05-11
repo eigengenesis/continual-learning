@@ -37,7 +37,6 @@ The current answer is scoped but real:
 | `qwen_tomography.py` | Layerwise activation/gradient SVD profiles, occupied bases, pressure scoring, layer selection, saturation reports. |
 | `standalone_latent_lora_qwen.py` | Shared model loading, latent adapter, LoRA-style modules, schedules, and utility code. |
 | `EXPERIMENTS.md` | Human-readable experiment summaries and safest public claims. |
-| `toy/` | Prototype mechanism experiments behind Amoeba, LSP, expansion, Z-law control, and verifier/self-acquisition. |
 
 ## Quick Sanity Check
 
