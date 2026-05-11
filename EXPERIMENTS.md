@@ -148,6 +148,67 @@ Safe public wording:
 Expansion showed the first pretrained-model signal that capacity growth can rescue learning when fixed geometry is too crowded.
 ```
 
+## 6. GSM8K -> Sort Baseline Comparison
+
+Script:
+
+```text
+gsm8k_sdft_baseline_audit.py
+```
+
+Setup:
+
+```text
+Model: Qwen/Qwen2.5-0.5B
+Old task: GSM8K subset
+New task: proof_v2 stable sort
+Baselines: naive SFT and SDFT-style self-distillation
+```
+
+Key result:
+
+```text
+GSM8K exact stayed 0.125 -> 0.125 under Amoeba no-proxy.
+Amoeba had the best new sort acquisition: 0.172 vs SFT 0.098 vs SDFT 0.006.
+```
+
+Safe public wording:
+
+```text
+This is a retention/acquisition tradeoff test on a recognizable task, not a claim that Qwen 0.5B is a strong GSM8K solver.
+```
+
+## 7. Qwen Z-Law / Z-Guided Expansion
+
+Script:
+
+```text
+qwen_z_law_controller_audit.py
+```
+
+Setup:
+
+```text
+Old skill: proof_v2 record routing
+New skill: tagged conflict task from the same records
+```
+
+Key result:
+
+```text
+Fixed no-growth learned the new task but forgot the old skill:
+old = 0.000, new = 1.000
+
+Z-selected frozen-base expansion preserved old skill and learned new:
+old = 0.751, new = 1.000
+```
+
+Safe public wording:
+
+```text
+This is the cleanest Qwen evidence that Z-guided adaptive plasticity can choose growth when fixed geometry cannot safely hold both behaviors.
+```
+
 ## Method Summary
 
 ```text
@@ -158,4 +219,3 @@ Expansion grows capacity when the fixed model is crowded.
 ```
 
 That is Eigenesis.
-
