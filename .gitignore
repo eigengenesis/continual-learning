@@ -1,0 +1,26 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.colab_cache/
+
+# Large/generated artifacts
+outputs/
+results/
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+*.tar.gz
+*.zip
+
+# Local data dumps
+gsm8k.jsonl
+shakespeare.txt
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
