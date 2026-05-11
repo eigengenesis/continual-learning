@@ -4,6 +4,12 @@ Research scripts for replay-free continual learning experiments on small pretrai
 
 This repo is a research artifact, not a polished library. The scripts are intentionally close to the experiments: they train adapter teachers, collect layerwise tomography, project gradients away from occupied subspaces, consolidate skills with old-checkpoint anchors, and benchmark against naive SFT / SDFT-style baselines.
 
+## Article
+
+Public writeup:
+
+https://x.com/eigengenesis/status/2053855070551437495
+
 ## What This Tests
 
 The core question:
@@ -93,4 +99,3 @@ If you use these scripts or ideas, please cite/link the repo:
 Eigenesis Continual Learning
 https://github.com/eigengenesis/continual-learning
 ```
-
