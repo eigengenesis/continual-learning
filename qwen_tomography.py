@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -61,6 +62,22 @@ class LayerSaturation:
     rank_pressure: float
     saturation_score: float
     learning_pressure: float
+
+
+@dataclass
+class UnitScore:
+    layer_index: int
+    layer_name: str
+    module_name: str
+    module_suffix: str
+    unit_type: str
+    unit_index: int
+    unit_start: int
+    unit_end: int
+    unit_count: int
+    domain_pressure: float
+    language_occupancy: float
+    free_domain_score: float
 
 
 @dataclass
@@ -293,6 +310,210 @@ def _mean_projection_overlap(samples: torch.Tensor, basis: torch.Tensor) -> floa
     proj_energy = (proj ** 2).sum(dim=-1)
     total_energy = (samples ** 2).sum(dim=-1).clamp_min(_EPS)
     return float((proj_energy / total_energy).mean().item())
+
+
+def _unit_occupancy(vectors: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    """Protected-basis energy fraction for matrix columns."""
+    if vectors.numel() == 0:
+        return torch.empty(0)
+    if basis.numel() == 0 or basis.shape[0] != vectors.shape[0]:
+        return torch.zeros(vectors.shape[1], dtype=vectors.dtype)
+    projected = basis.transpose(0, 1) @ vectors
+    projected_energy = projected.square().sum(dim=0)
+    total_energy = vectors.square().sum(dim=0).clamp_min(_EPS)
+    return projected_energy / total_energy
+
+
+def _unit_score(domain_pressure: float, language_occupancy: float, eps: float) -> float:
+    return float(domain_pressure) / max(float(language_occupancy), float(eps))
+
+
+def collect_fine_grained_unit_scores(
+    model: nn.Module,
+    task_batches: List[Dict[str, torch.Tensor]],
+    old_profiles: List[TaskProfile],
+    *,
+    target_suffix: str = DEFAULT_TARGET_SUFFIX,
+    unit_type: str = "mlp_column",
+    num_batches: int = TOMOGRAPHY_BATCHES,
+    num_heads: int | None = None,
+    occupancy_mode: str = "activation",
+    score_eps: float = 1e-3,
+) -> List[UnitScore]:
+    """Score MLP columns or attention heads by language-free domain pressure.
+
+    For the default `mlp_column` mode, each `mlp.down_proj` column is one MLP
+    channel's residual contribution. Domain pressure is the column gradient
+    norm on the domain batches. Language occupancy is the fraction of that
+    gradient in the protected language basis. The resulting score is:
+
+        domain_pressure / (language_occupancy + eps)
+
+    `attention_head` mode groups `o_proj` columns into head slices for logging.
+    """
+    if unit_type not in {"mlp_column", "attention_head"}:
+        raise ValueError(f"unsupported unit_type: {unit_type}")
+
+    modules = _matching_modules(model, target_suffix)
+    if not modules:
+        raise ValueError(f"no modules found for suffix {target_suffix}")
+
+    inferred_heads = num_heads
+    if inferred_heads is None:
+        inferred_heads = int(getattr(getattr(model, "config", None), "num_attention_heads", 0) or 0)
+
+    device = next(model.parameters()).device
+    original_requires_grad: Dict[nn.Parameter, bool] = {}
+    accum: Dict[Tuple[int, str], Dict[str, object]] = {}
+    for layer_index, name, module in modules:
+        weight = getattr(module, "weight", None)
+        if weight is None or weight.ndim != 2:
+            continue
+        original_requires_grad[weight] = bool(weight.requires_grad)
+        weight.requires_grad_(True)
+        unit_count = int(weight.shape[1])
+        if unit_type == "attention_head":
+            if inferred_heads <= 0 or int(weight.shape[1]) % inferred_heads != 0:
+                continue
+            unit_count = inferred_heads
+        accum[(layer_index, name)] = {
+            "module": module,
+            "domain": torch.zeros(unit_count, dtype=torch.float64),
+            "occupancy": torch.zeros(unit_count, dtype=torch.float64),
+            "count": 0,
+            "unit_count": unit_count,
+        }
+
+    was_training = model.training
+    model.train()
+    try:
+        with torch.enable_grad():
+            for batch in task_batches[:num_batches]:
+                batch = _move_batch_to_device(batch, device)
+                model.zero_grad(set_to_none=True)
+                outputs = model(**batch, use_cache=False)
+                loss = getattr(outputs, "loss", None)
+                if loss is None:
+                    logits = outputs.logits
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = batch["input_ids"][..., 1:].contiguous()
+                    loss = nn.functional.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                    )
+                loss.backward()
+
+                for layer_index, name, module in modules:
+                    payload = accum.get((layer_index, name))
+                    if payload is None:
+                        continue
+                    weight = getattr(module, "weight", None)
+                    grad = None if weight is None else weight.grad
+                    if grad is None or grad.ndim != 2:
+                        continue
+                    grad_cpu = grad.detach().float().cpu()
+                    basis = build_occupied_basis(old_profiles, layer_index, mode=occupancy_mode)
+                    if basis.numel() == 0 or basis.shape[0] != grad_cpu.shape[0]:
+                        basis = build_occupied_basis(old_profiles, layer_index, mode="union")
+                    basis = basis.detach().float().cpu()
+
+                    if unit_type == "mlp_column":
+                        pressure = grad_cpu.norm(dim=0).double()
+                        occupancy = _unit_occupancy(grad_cpu, basis).double()
+                    else:
+                        head_count = int(payload["unit_count"])
+                        head_dim = grad_cpu.shape[1] // max(head_count, 1)
+                        pressures: List[float] = []
+                        occupancies: List[float] = []
+                        for head_idx in range(head_count):
+                            start = head_idx * head_dim
+                            end = start + head_dim
+                            block = grad_cpu[:, start:end]
+                            pressures.append(float(block.norm().item()))
+                            if basis.numel() == 0 or basis.shape[0] != block.shape[0]:
+                                occupancies.append(0.0)
+                            else:
+                                projected = basis.transpose(0, 1) @ block
+                                occupancies.append(
+                                    float(projected.square().sum().item() / max(float(block.square().sum().item()), _EPS))
+                                )
+                        pressure = torch.tensor(pressures, dtype=torch.float64)
+                        occupancy = torch.tensor(occupancies, dtype=torch.float64)
+
+                    payload["domain"] = payload["domain"] + pressure
+                    payload["occupancy"] = payload["occupancy"] + occupancy
+                    payload["count"] = int(payload["count"]) + 1
+    finally:
+        model.zero_grad(set_to_none=True)
+        for param, flag in original_requires_grad.items():
+            param.requires_grad_(flag)
+        model.train(was_training)
+
+    scores: List[UnitScore] = []
+    for layer_key, payload in accum.items():
+        layer_index, name = layer_key
+        count = max(int(payload["count"]), 1)
+        domain = (payload["domain"] / count).float()
+        occupancy = (payload["occupancy"] / count).float().clamp(min=0.0, max=1.0)
+        unit_count = int(payload["unit_count"])
+        span_width = 1
+        if unit_type == "attention_head":
+            module = payload["module"]
+            weight = getattr(module, "weight", None)
+            span_width = int(weight.shape[1]) // max(unit_count, 1) if weight is not None else 1
+        for unit_index in range(unit_count):
+            start = unit_index * span_width
+            end = start + span_width
+            pressure = float(domain[unit_index].item())
+            occ = float(occupancy[unit_index].item())
+            scores.append(
+                UnitScore(
+                    layer_index=int(layer_index),
+                    layer_name=str(name),
+                    module_name=str(name),
+                    module_suffix=str(target_suffix),
+                    unit_type=unit_type,
+                    unit_index=int(unit_index),
+                    unit_start=int(start),
+                    unit_end=int(end),
+                    unit_count=int(unit_count),
+                    domain_pressure=pressure,
+                    language_occupancy=occ,
+                    free_domain_score=_unit_score(pressure, occ, score_eps),
+                )
+            )
+    scores.sort(key=lambda item: item.free_domain_score, reverse=True)
+    return scores
+
+
+def select_top_unit_indices(
+    scores: Sequence[UnitScore],
+    selected_layers: Sequence[int],
+    *,
+    budget_fraction: float,
+    min_units_per_layer: int = 1,
+    max_units_per_layer: int | None = None,
+) -> Dict[int, List[int]]:
+    selected = {int(layer) for layer in selected_layers}
+    by_layer: Dict[int, List[UnitScore]] = {}
+    unit_counts: Dict[int, int] = {}
+    for score in scores:
+        layer_index = int(score.layer_index)
+        if layer_index not in selected:
+            continue
+        by_layer.setdefault(layer_index, []).append(score)
+        unit_counts[layer_index] = max(unit_counts.get(layer_index, 0), int(score.unit_count))
+
+    out: Dict[int, List[int]] = {}
+    for layer_index, layer_scores in by_layer.items():
+        ordered = sorted(layer_scores, key=lambda item: item.free_domain_score, reverse=True)
+        count = max(unit_counts.get(layer_index, len(ordered)), 1)
+        keep = max(int(min_units_per_layer), int(math.ceil(count * float(budget_fraction))))
+        if max_units_per_layer is not None and max_units_per_layer > 0:
+            keep = min(keep, int(max_units_per_layer))
+        keep = min(keep, len(ordered))
+        out[layer_index] = sorted(int(item.unit_index) for item in ordered[:keep])
+    return out
 
 
 def compute_layer_saturation(
@@ -581,3 +802,26 @@ def write_tomography_csv(
                             int(item.expansion_trigger),
                         ]
                     )
+
+
+def write_unit_scores_csv(path: Path, scores: Iterable[UnitScore]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "layer_index",
+        "layer_name",
+        "module_name",
+        "module_suffix",
+        "unit_type",
+        "unit_index",
+        "unit_start",
+        "unit_end",
+        "unit_count",
+        "domain_pressure",
+        "language_occupancy",
+        "free_domain_score",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for score in scores:
+            writer.writerow(asdict(score))

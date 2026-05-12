@@ -654,27 +654,45 @@ def _prepare_supervised_batch(
     device: str,
     max_length: int,
 ) -> Dict[str, torch.Tensor]:
-    texts = [f"{prompt}{target}" for prompt, target in zip(prompts, targets)]
-    enc = tokenizer(
-        texts,
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
-    )
-    labels = enc["input_ids"].clone()
-    for row_idx, prompt in enumerate(prompts):
-        prompt_ids = tokenizer(
-            prompt,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt",
-        )["input_ids"][0]
-        labels[row_idx, : prompt_ids.size(0)] = -100
+    rows: List[torch.Tensor] = []
+    label_rows: List[torch.Tensor] = []
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    if pad_id is None:
+        pad_id = 0
+
+    for prompt, target in zip(prompts, targets):
+        prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        target_ids = tokenizer(target, add_special_tokens=False)["input_ids"]
+        if not target_ids and tokenizer.eos_token_id is not None:
+            target_ids = [int(tokenizer.eos_token_id)]
+
+        if len(target_ids) >= max_length:
+            input_ids = target_ids[:max_length]
+            labels = list(input_ids)
+        else:
+            prompt_budget = max(max_length - len(target_ids), 0)
+            prompt_tail = prompt_ids[-prompt_budget:] if prompt_budget else []
+            input_ids = prompt_tail + target_ids
+            labels = [-100] * len(prompt_tail) + list(target_ids)
+
+        rows.append(torch.tensor(input_ids, dtype=torch.long))
+        label_rows.append(torch.tensor(labels, dtype=torch.long))
+
+    batch_len = max((row.numel() for row in rows), default=0)
+    input_batch = torch.full((len(rows), batch_len), int(pad_id), dtype=torch.long)
+    attention_mask = torch.zeros((len(rows), batch_len), dtype=torch.long)
+    labels_batch = torch.full((len(rows), batch_len), -100, dtype=torch.long)
+    for row_idx, (input_ids, labels) in enumerate(zip(rows, label_rows)):
+        length = int(input_ids.numel())
+        input_batch[row_idx, :length] = input_ids
+        attention_mask[row_idx, :length] = 1
+        labels_batch[row_idx, :length] = labels
     return {
-        "input_ids": enc["input_ids"].to(device),
-        "attention_mask": enc["attention_mask"].to(device),
-        "labels": labels.to(device),
+        "input_ids": input_batch.to(device),
+        "attention_mask": attention_mask.to(device),
+        "labels": labels_batch.to(device),
     }
 
 
