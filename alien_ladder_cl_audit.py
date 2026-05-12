@@ -47,6 +47,7 @@ from standalone_latent_lora_qwen import (
 
 TARGET_SUFFIXES = ("mlp.down_proj", "mlp.up_proj")
 MAX_GENERATION_PROMPT_LEN = 256
+ALL_D_VARIANTS = ("naive_sft", "sdft_baseline", "fixed_no_proxy", "expanded_no_proxy")
 
 
 def line(char: str = "=") -> None:
@@ -117,6 +118,39 @@ def stage_weight(args: argparse.Namespace, name: str, fallback: str) -> float:
     if value is None:
         value = getattr(args, fallback)
     return float(value)
+
+
+def parse_d_variants(value: str) -> List[str]:
+    aliases = {
+        "naive": "naive_sft",
+        "sft": "naive_sft",
+        "naive_sft": "naive_sft",
+        "sdft": "sdft_baseline",
+        "sdft_baseline": "sdft_baseline",
+        "fixed": "fixed_no_proxy",
+        "no_proxy": "fixed_no_proxy",
+        "fixed_no_proxy": "fixed_no_proxy",
+        "expanded": "expanded_no_proxy",
+        "expansion": "expanded_no_proxy",
+        "expanded_no_proxy": "expanded_no_proxy",
+    }
+    raw = str(value or "all").strip().lower()
+    if raw in {"all", "default", "*"}:
+        return list(ALL_D_VARIANTS)
+    selected: List[str] = []
+    for part in raw.split(","):
+        key = part.strip().lower().replace("-", "_")
+        if not key:
+            continue
+        if key not in aliases:
+            allowed = ", ".join(["all", *ALL_D_VARIANTS])
+            raise ValueError(f"unknown D variant '{part.strip()}'; allowed: {allowed}")
+        variant = aliases[key]
+        if variant not in selected:
+            selected.append(variant)
+    if not selected:
+        raise ValueError("--d-variants selected no variants")
+    return selected
 
 
 def kl_divergence_to_student_device(student_logits: torch.Tensor, teacher_logits: torch.Tensor, temperature: float = 2.0) -> torch.Tensor:
@@ -1530,6 +1564,11 @@ def run_preflight(
 
 def run() -> None:
     args = build_arg_parser().parse_args()
+    try:
+        args.d_variants = parse_d_variants(args.d_variants)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    selected_d_variants = set(args.d_variants)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     model_id = args.model_id or default_model_id(args.local_files_only)
@@ -1544,7 +1583,7 @@ def run() -> None:
     print(f"device={args.device} dtype={args.dtype} seed={args.seed}", flush=True)
     print(f"teacher_device={aux_teacher_device} (for frozen teachers during consolidation/SDFT)", flush=True)
     print("tasks: B=SCAN -> C=COGS/ListOps/proof_v2 fallback -> D=GeoQuery", flush=True)
-    print("variants: naive_sft | sdft_baseline | fixed_no_proxy | expanded_no_proxy", flush=True)
+    print(f"variants selected: {', '.join(args.d_variants)}", flush=True)
     print("stdout is a convenience artifact; JSONL/CSV are the plot artifacts.", flush=True)
 
     logger.write_json("run_config.json", vars(args))
@@ -1800,143 +1839,161 @@ def run() -> None:
     checkpoint_model(teacher_d, tokenizer, out_dir, "teacher_D_GeoQuery", args.checkpoint_policy, {"stage": "teacher_D_GeoQuery", "metrics": teacher_d_metrics})
 
     active_all = [scan_task, c_task, geo_task]
+    variant_metrics: Dict[str, Optional[Dict[str, float]]] = {label: None for label in ALL_D_VARIANTS}
 
-    subsection("Variant 1: D naive SFT")
-    naive = qp._clone_model(base_abc, cfg.device)
-    naive_metrics = consolidate_naive(
-        student=naive,
-        tokenizer=tokenizer,
-        task=geo_task,
-        active_eval_tasks=active_all,
-        cfg=cfg,
-        logger=logger,
-        stage="D_naive_sft",
-        steps=args.d_variant_steps,
-        lr=args.consolidation_lr,
-    )
-    checkpoint_model(naive, tokenizer, out_dir, "D_naive_sft", args.checkpoint_policy, {"stage": "D_naive_sft", "metrics": naive_metrics})
-    del naive
-    release()
+    if "naive_sft" in selected_d_variants:
+        subsection("Variant 1: D naive SFT")
+        naive = qp._clone_model(base_abc, cfg.device)
+        naive_metrics = consolidate_naive(
+            student=naive,
+            tokenizer=tokenizer,
+            task=geo_task,
+            active_eval_tasks=active_all,
+            cfg=cfg,
+            logger=logger,
+            stage="D_naive_sft",
+            steps=args.d_variant_steps,
+            lr=args.consolidation_lr,
+        )
+        variant_metrics["naive_sft"] = naive_metrics
+        checkpoint_model(naive, tokenizer, out_dir, "D_naive_sft", args.checkpoint_policy, {"stage": "D_naive_sft", "metrics": naive_metrics})
+        del naive
+        release()
+    else:
+        logger.log_event("variant_skipped", variant="naive_sft", reason="not selected by --d-variants")
 
-    subsection("Variant 2: D SDFT baseline")
-    sdft = qp._clone_model(base_abc, cfg.device)
-    sdft_metrics = consolidate_sdft(
-        student=sdft,
-        teacher_new=teacher_d,
-        tokenizer=tokenizer,
-        task=geo_task,
-        active_eval_tasks=active_all,
-        cfg=cfg,
-        logger=logger,
-        stage="D_sdft_baseline",
-        steps=args.d_variant_steps,
-        lr=args.consolidation_lr,
-        teacher_device=aux_teacher_device,
-        loss_type=args.sdft_loss,
-        do_sample=args.sdft_do_sample,
-        temperature=args.sdft_temperature,
-        top_p=args.sdft_top_p,
-    )
-    checkpoint_model(sdft, tokenizer, out_dir, "D_sdft_baseline", args.checkpoint_policy, {"stage": "D_sdft_baseline", "metrics": sdft_metrics})
-    del sdft
-    release()
+    if "sdft_baseline" in selected_d_variants:
+        subsection("Variant 2: D SDFT baseline")
+        sdft = qp._clone_model(base_abc, cfg.device)
+        sdft_metrics = consolidate_sdft(
+            student=sdft,
+            teacher_new=teacher_d,
+            tokenizer=tokenizer,
+            task=geo_task,
+            active_eval_tasks=active_all,
+            cfg=cfg,
+            logger=logger,
+            stage="D_sdft_baseline",
+            steps=args.d_variant_steps,
+            lr=args.consolidation_lr,
+            teacher_device=aux_teacher_device,
+            loss_type=args.sdft_loss,
+            do_sample=args.sdft_do_sample,
+            temperature=args.sdft_temperature,
+            top_p=args.sdft_top_p,
+        )
+        variant_metrics["sdft_baseline"] = sdft_metrics
+        checkpoint_model(sdft, tokenizer, out_dir, "D_sdft_baseline", args.checkpoint_policy, {"stage": "D_sdft_baseline", "metrics": sdft_metrics})
+        del sdft
+        release()
+    else:
+        logger.log_event("variant_skipped", variant="sdft_baseline", reason="not selected by --d-variants")
 
-    subsection("Variant 3: D fixed no-proxy")
-    fixed = qp._clone_model(base_abc, cfg.device)
-    fixed_metrics = consolidate_no_proxy(
-        student=fixed,
-        teacher_old=base_abc,
-        teacher_new=teacher_d,
-        tokenizer=tokenizer,
-        task=geo_task,
-        active_eval_tasks=active_all,
-        selected_layers=d_layers,
-        old_profiles=protected_profiles,
-        cfg=cfg,
-        logger=logger,
-        stage="D_fixed_no_proxy",
-        steps=args.d_variant_steps,
-        lr=args.consolidation_lr,
-        old_kl_weight=args.no_proxy_old_kl_weight,
-        old_hidden_weight=args.no_proxy_old_hidden_weight,
-        new_kl_weight=args.new_kl_weight,
-        new_hidden_weight=args.new_hidden_weight,
-        project_gradients=args.gradient_projection,
-        projection_strength=args.projection_strength,
-        teacher_device=aux_teacher_device,
-    )
-    checkpoint_model(fixed, tokenizer, out_dir, "D_fixed_no_proxy", args.checkpoint_policy, {"stage": "D_fixed_no_proxy", "metrics": fixed_metrics})
-    del fixed
-    release()
+    if "fixed_no_proxy" in selected_d_variants:
+        subsection("Variant 3: D fixed no-proxy")
+        fixed = qp._clone_model(base_abc, cfg.device)
+        fixed_metrics = consolidate_no_proxy(
+            student=fixed,
+            teacher_old=base_abc,
+            teacher_new=teacher_d,
+            tokenizer=tokenizer,
+            task=geo_task,
+            active_eval_tasks=active_all,
+            selected_layers=d_layers,
+            old_profiles=protected_profiles,
+            cfg=cfg,
+            logger=logger,
+            stage="D_fixed_no_proxy",
+            steps=args.d_variant_steps,
+            lr=args.consolidation_lr,
+            old_kl_weight=args.no_proxy_old_kl_weight,
+            old_hidden_weight=args.no_proxy_old_hidden_weight,
+            new_kl_weight=args.new_kl_weight,
+            new_hidden_weight=args.new_hidden_weight,
+            project_gradients=args.gradient_projection,
+            projection_strength=args.projection_strength,
+            teacher_device=aux_teacher_device,
+        )
+        variant_metrics["fixed_no_proxy"] = fixed_metrics
+        checkpoint_model(fixed, tokenizer, out_dir, "D_fixed_no_proxy", args.checkpoint_policy, {"stage": "D_fixed_no_proxy", "metrics": fixed_metrics})
+        del fixed
+        release()
+    else:
+        logger.log_event("variant_skipped", variant="fixed_no_proxy", reason="not selected by --d-variants")
 
-    subsection("Variant 4: D expanded no-proxy")
-    insert_after = int(d_layers[0]) if d_layers else 0
-    expanded_teacher = qp._clone_model(base_abc, cfg.device)
-    expanded_teacher, _ = qp.insert_expansion_layer(expanded_teacher, insert_after)
-    expanded_layers = sorted(set([idx if idx <= insert_after else idx + 1 for idx in d_layers] + [insert_after + 1]))
-    expanded_teacher_metrics = train_adapter_teacher(
-        model=expanded_teacher,
-        tokenizer=tokenizer,
-        task=geo_task,
-        active_eval_tasks=active_all,
-        cfg=cfg,
-        logger=logger,
-        stage="teacher_D_GeoQuery_expanded",
-        selected_layers=expanded_layers,
-        steps=args.expansion_teacher_steps,
-        lr=args.teacher_lr,
-        rank=args.d_rank,
-        alpha=args.d_alpha,
-        gate_init=args.teacher_gate_init,
-        eval_interval=args.eval_interval,
-        train_gated_layers=True,
-    )
-    checkpoint_model(
-        expanded_teacher,
-        tokenizer,
-        out_dir,
-        "teacher_D_GeoQuery_expanded",
-        args.checkpoint_policy,
-        {"stage": "teacher_D_GeoQuery_expanded", "metrics": expanded_teacher_metrics, "insert_after": insert_after},
-    )
+    if "expanded_no_proxy" in selected_d_variants:
+        subsection("Variant 4: D expanded no-proxy")
+        insert_after = int(d_layers[0]) if d_layers else 0
+        expanded_teacher = qp._clone_model(base_abc, cfg.device)
+        expanded_teacher, _ = qp.insert_expansion_layer(expanded_teacher, insert_after)
+        expanded_layers = sorted(set([idx if idx <= insert_after else idx + 1 for idx in d_layers] + [insert_after + 1]))
+        expanded_teacher_metrics = train_adapter_teacher(
+            model=expanded_teacher,
+            tokenizer=tokenizer,
+            task=geo_task,
+            active_eval_tasks=active_all,
+            cfg=cfg,
+            logger=logger,
+            stage="teacher_D_GeoQuery_expanded",
+            selected_layers=expanded_layers,
+            steps=args.expansion_teacher_steps,
+            lr=args.teacher_lr,
+            rank=args.d_rank,
+            alpha=args.d_alpha,
+            gate_init=args.teacher_gate_init,
+            eval_interval=args.eval_interval,
+            train_gated_layers=True,
+        )
+        checkpoint_model(
+            expanded_teacher,
+            tokenizer,
+            out_dir,
+            "teacher_D_GeoQuery_expanded",
+            args.checkpoint_policy,
+            {"stage": "teacher_D_GeoQuery_expanded", "metrics": expanded_teacher_metrics, "insert_after": insert_after},
+        )
 
-    expanded_old = qp._clone_model(base_abc, cfg.device)
-    expanded_old, _ = qp.insert_expansion_layer(expanded_old, insert_after)
-    expanded_student = qp._clone_model(base_abc, cfg.device)
-    expanded_student, _ = qp.insert_expansion_layer(expanded_student, insert_after)
-    expanded_metrics = consolidate_no_proxy(
-        student=expanded_student,
-        teacher_old=expanded_old,
-        teacher_new=expanded_teacher,
-        tokenizer=tokenizer,
-        task=geo_task,
-        active_eval_tasks=active_all,
-        selected_layers=expanded_layers,
-        old_profiles=protected_profiles,
-        cfg=cfg,
-        logger=logger,
-        stage="D_expanded_no_proxy",
-        steps=args.expansion_steps,
-        lr=args.consolidation_lr,
-        old_kl_weight=args.no_proxy_old_kl_weight,
-        old_hidden_weight=args.no_proxy_old_hidden_weight,
-        new_kl_weight=args.new_kl_weight,
-        new_hidden_weight=args.new_hidden_weight,
-        project_gradients=args.gradient_projection,
-        projection_strength=args.projection_strength,
-        teacher_device=aux_teacher_device,
-    )
-    checkpoint_model(
-        expanded_student,
-        tokenizer,
-        out_dir,
-        "D_expanded_no_proxy",
-        args.checkpoint_policy,
-        {"stage": "D_expanded_no_proxy", "metrics": expanded_metrics, "insert_after": insert_after},
-    )
-    del expanded_old
-    del expanded_teacher
-    del expanded_student
+        expanded_old = qp._clone_model(base_abc, cfg.device)
+        expanded_old, _ = qp.insert_expansion_layer(expanded_old, insert_after)
+        expanded_student = qp._clone_model(base_abc, cfg.device)
+        expanded_student, _ = qp.insert_expansion_layer(expanded_student, insert_after)
+        expanded_metrics = consolidate_no_proxy(
+            student=expanded_student,
+            teacher_old=expanded_old,
+            teacher_new=expanded_teacher,
+            tokenizer=tokenizer,
+            task=geo_task,
+            active_eval_tasks=active_all,
+            selected_layers=expanded_layers,
+            old_profiles=protected_profiles,
+            cfg=cfg,
+            logger=logger,
+            stage="D_expanded_no_proxy",
+            steps=args.expansion_steps,
+            lr=args.consolidation_lr,
+            old_kl_weight=args.no_proxy_old_kl_weight,
+            old_hidden_weight=args.no_proxy_old_hidden_weight,
+            new_kl_weight=args.new_kl_weight,
+            new_hidden_weight=args.new_hidden_weight,
+            project_gradients=args.gradient_projection,
+            projection_strength=args.projection_strength,
+            teacher_device=aux_teacher_device,
+        )
+        variant_metrics["expanded_no_proxy"] = expanded_metrics
+        checkpoint_model(
+            expanded_student,
+            tokenizer,
+            out_dir,
+            "D_expanded_no_proxy",
+            args.checkpoint_policy,
+            {"stage": "D_expanded_no_proxy", "metrics": expanded_metrics, "insert_after": insert_after},
+        )
+        del expanded_old
+        del expanded_teacher
+        del expanded_student
+    else:
+        logger.log_event("variant_skipped", variant="expanded_no_proxy", reason="not selected by --d-variants")
+
     del teacher_d
     del base_abc
     release()
@@ -1948,10 +2005,10 @@ def run() -> None:
         c_task=c_task,
         geo=geo_task,
         base_abc=base_abc_metrics,
-        naive=naive_metrics,
-        sdft=sdft_metrics,
-        fixed=fixed_metrics,
-        expanded=expanded_metrics,
+        naive=variant_metrics["naive_sft"],
+        sdft=variant_metrics["sdft_baseline"],
+        fixed=variant_metrics["fixed_no_proxy"],
+        expanded=variant_metrics["expanded_no_proxy"],
         args=args,
     )
     print(f"artifacts={out_dir}", flush=True)
@@ -1964,10 +2021,10 @@ def summarize_verdict(
     c_task: TaskData,
     geo: TaskData,
     base_abc: Dict[str, float],
-    naive: Dict[str, float],
-    sdft: Dict[str, float],
-    fixed: Dict[str, float],
-    expanded: Dict[str, float],
+    naive: Optional[Dict[str, float]],
+    sdft: Optional[Dict[str, float]],
+    fixed: Optional[Dict[str, float]],
+    expanded: Optional[Dict[str, float]],
     args: argparse.Namespace,
 ) -> None:
     def m(metrics: Dict[str, float], key: str) -> float:
@@ -1976,21 +2033,29 @@ def summarize_verdict(
         except Exception:
             return float("nan")
 
-    rows = {
+    rows_all = {
         "naive_sft": naive,
         "sdft_baseline": sdft,
         "fixed_no_proxy": fixed,
         "expanded_no_proxy": expanded,
     }
+    rows = {label: metrics for label, metrics in rows_all.items() if metrics is not None}
     row_stats: Dict[str, Dict[str, float]] = {}
+    for label in ALL_D_VARIANTS:
+        if rows_all.get(label) is None:
+            print(f"{label:<20} SKIPPED by --d-variants", flush=True)
+            logger.log_event("verdict_row_skipped", variant=label, reason="not selected by --d-variants")
     for label, metrics in rows.items():
         scan_ret = m(metrics, f"{scan.spec.name}_token_acc")
+        scan_exact = m(metrics, f"{scan.spec.name}_exact")
         scan_tf_ret = m(metrics, f"{scan.spec.name}_tf_token_acc")
         scan_hybrid = max(scan_ret, scan_tf_ret)
         c_ret = m(metrics, f"{c_task.spec.name}_token_acc")
+        c_exact = m(metrics, f"{c_task.spec.name}_exact")
         c_tf_ret = m(metrics, f"{c_task.spec.name}_tf_token_acc")
         c_hybrid = max(c_ret, c_tf_ret)
         geo_acc = m(metrics, f"{geo.spec.name}_token_acc")
+        geo_exact = m(metrics, f"{geo.spec.name}_exact")
         geo_tf = m(metrics, f"{geo.spec.name}_tf_token_acc")
         geo_hybrid = max(geo_acc, geo_tf)
         geo_loss = m(metrics, f"{geo.spec.name}_tf_loss")
@@ -1998,12 +2063,15 @@ def summarize_verdict(
         ppl_preservation = 1.0 / max(ppl_ratio, 1e-9)
         row_stats[label] = {
             "scan_ret": scan_ret,
+            "scan_exact": scan_exact,
             "scan_tf_ret": scan_tf_ret,
             "scan_hybrid": scan_hybrid,
             "c_ret": c_ret,
+            "c_exact": c_exact,
             "c_tf_ret": c_tf_ret,
             "c_hybrid": c_hybrid,
             "geo_acc": geo_acc,
+            "geo_exact": geo_exact,
             "geo_tf": geo_tf,
             "geo_hybrid": geo_hybrid,
             "geo_loss": geo_loss,
@@ -2024,12 +2092,15 @@ def summarize_verdict(
             "verdict_row",
             variant=label,
             scan_retention=scan_ret,
+            scan_exact=scan_exact,
             scan_tf_retention=scan_tf_ret,
             scan_hybrid_retention=scan_hybrid,
             c_retention=c_ret,
+            c_exact=c_exact,
             c_tf_retention=c_tf_ret,
             c_hybrid_retention=c_hybrid,
             geo_token_acc=geo_acc,
+            geo_exact=geo_exact,
             geo_tf_token_acc=geo_tf,
             geo_hybrid_acc=geo_hybrid,
             geo_loss=geo_loss,
@@ -2041,54 +2112,75 @@ def summarize_verdict(
 
     # Treat expansion as optional capacity, not a mandatory win condition. If
     # fixed no-proxy already has enough room, it should be allowed to win.
-    no_proxy_labels = ("fixed_no_proxy", "expanded_no_proxy")
-    baseline_labels = ("naive_sft", "sdft_baseline")
-    best_no_proxy = max(
-        no_proxy_labels,
-        key=lambda label: (
-            row_stats[label]["scan_hybrid"]
-            + row_stats[label]["c_hybrid"]
-            + row_stats[label]["geo_hybrid"]
-            + 0.25 * row_stats[label]["ppl_preservation"]
-        ),
-    )
-    expanded_beats_fixed = row_stats["expanded_no_proxy"]["geo_hybrid"] >= row_stats["fixed_no_proxy"]["geo_hybrid"] and (
-        row_stats["expanded_no_proxy"]["scan_hybrid"] >= row_stats["fixed_no_proxy"]["scan_hybrid"] - 0.02
-        and row_stats["expanded_no_proxy"]["c_hybrid"] >= row_stats["fixed_no_proxy"]["c_hybrid"] - 0.02
-    )
+    no_proxy_labels = tuple(label for label in ("fixed_no_proxy", "expanded_no_proxy") if label in row_stats)
+    baseline_labels = tuple(label for label in ("naive_sft", "sdft_baseline") if label in row_stats)
+    best_no_proxy = ""
+    if no_proxy_labels:
+        best_no_proxy = max(
+            no_proxy_labels,
+            key=lambda label: (
+                row_stats[label]["scan_hybrid"]
+                + row_stats[label]["c_hybrid"]
+                + row_stats[label]["geo_hybrid"]
+                + 0.25 * row_stats[label]["ppl_preservation"]
+            ),
+        )
+    expanded_beats_fixed = False
+    if "expanded_no_proxy" in row_stats and "fixed_no_proxy" in row_stats:
+        expanded_beats_fixed = row_stats["expanded_no_proxy"]["geo_hybrid"] >= row_stats["fixed_no_proxy"]["geo_hybrid"] and (
+            row_stats["expanded_no_proxy"]["scan_hybrid"] >= row_stats["fixed_no_proxy"]["scan_hybrid"] - 0.02
+            and row_stats["expanded_no_proxy"]["c_hybrid"] >= row_stats["fixed_no_proxy"]["c_hybrid"] - 0.02
+        )
     expansion_needed = bool(expanded_beats_fixed)
-    best_baseline_ppl = min(row_stats[label]["ppl_ratio"] for label in baseline_labels)
-    best_no_proxy_ppl = min(row_stats[label]["ppl_ratio"] for label in no_proxy_labels)
-    ppl_rescue_pass = bool(best_no_proxy_ppl < best_baseline_ppl)
-    no_proxy_beats_sdft_retention = (
-        row_stats["fixed_no_proxy"]["scan_hybrid"] >= row_stats["sdft_baseline"]["scan_hybrid"]
-        and row_stats["fixed_no_proxy"]["c_hybrid"] >= row_stats["sdft_baseline"]["c_hybrid"]
-    ) or (
-        row_stats["expanded_no_proxy"]["scan_hybrid"] >= row_stats["sdft_baseline"]["scan_hybrid"]
-        and row_stats["expanded_no_proxy"]["c_hybrid"] >= row_stats["sdft_baseline"]["c_hybrid"]
+    best_baseline_ppl = min((row_stats[label]["ppl_ratio"] for label in baseline_labels), default=float("nan"))
+    best_no_proxy_ppl = min((row_stats[label]["ppl_ratio"] for label in no_proxy_labels), default=float("nan"))
+    comparative_claim_available = bool(no_proxy_labels and baseline_labels)
+    ppl_rescue_pass = bool(comparative_claim_available and best_no_proxy_ppl < best_baseline_ppl)
+
+    def beats_retention(no_proxy_label: str, baseline_label: str) -> bool:
+        return (
+            row_stats[no_proxy_label]["scan_hybrid"] >= row_stats[baseline_label]["scan_hybrid"]
+            and row_stats[no_proxy_label]["c_hybrid"] >= row_stats[baseline_label]["c_hybrid"]
+        )
+
+    no_proxy_retention_rescue = bool(
+        comparative_claim_available
+        and all(any(beats_retention(no_proxy_label, baseline_label) for no_proxy_label in no_proxy_labels) for baseline_label in baseline_labels)
     )
-    no_proxy_beats_naive_retention = (
-        row_stats["fixed_no_proxy"]["scan_hybrid"] >= row_stats["naive_sft"]["scan_hybrid"]
-        and row_stats["fixed_no_proxy"]["c_hybrid"] >= row_stats["naive_sft"]["c_hybrid"]
-    ) or (
-        row_stats["expanded_no_proxy"]["scan_hybrid"] >= row_stats["naive_sft"]["scan_hybrid"]
-        and row_stats["expanded_no_proxy"]["c_hybrid"] >= row_stats["naive_sft"]["c_hybrid"]
+    no_proxy_new_task_competitive = bool(
+        comparative_claim_available
+        and best_no_proxy
+        and row_stats[best_no_proxy]["geo_hybrid"] >= min(row_stats[label]["geo_hybrid"] for label in baseline_labels) - 0.02
     )
-    no_proxy_retention_rescue = bool(no_proxy_beats_sdft_retention and no_proxy_beats_naive_retention)
-    no_proxy_new_task_competitive = (
-        row_stats[best_no_proxy]["geo_hybrid"]
-        >= min(row_stats["naive_sft"]["geo_hybrid"], row_stats["sdft_baseline"]["geo_hybrid"]) - 0.02
+    ppl_ok = bool(no_proxy_labels and best_no_proxy_ppl <= float(args.max_ppl_ratio))
+
+    def task_gate_pass(label: str, task: TaskData) -> bool:
+        if task is scan:
+            hybrid = row_stats[label]["scan_hybrid"]
+            exact = row_stats[label]["scan_exact"]
+        elif task is c_task:
+            hybrid = row_stats[label]["c_hybrid"]
+            exact = row_stats[label]["c_exact"]
+        else:
+            hybrid = row_stats[label]["geo_hybrid"]
+            exact = row_stats[label]["geo_exact"]
+        return bool(hybrid >= float(task.spec.token_gate) or exact >= float(task.spec.exact_gate))
+
+    sequential_method_pass = bool(
+        best_no_proxy
+        and task_gate_pass(best_no_proxy, scan)
+        and task_gate_pass(best_no_proxy, c_task)
+        and task_gate_pass(best_no_proxy, geo)
+        and row_stats[best_no_proxy]["ppl_ratio"] <= float(args.max_ppl_ratio)
     )
-    ppl_ok = min(
-        m(fixed, "wikitext_ppl") / max(m(base_abc, "wikitext_ppl"), 1e-9),
-        m(expanded, "wikitext_ppl") / max(m(base_abc, "wikitext_ppl"), 1e-9),
-    ) <= float(args.max_ppl_ratio)
-    stress_test_pass = bool(no_proxy_retention_rescue and ppl_rescue_pass and no_proxy_new_task_competitive)
+    stress_test_pass = bool(comparative_claim_available and no_proxy_retention_rescue and ppl_rescue_pass and no_proxy_new_task_competitive)
     paper_ready = bool(stress_test_pass and ppl_ok)
     print(
         f"stress_test={'PASS' if stress_test_pass else 'PARTIAL'} "
         f"paper_ready={'PASS' if paper_ready else 'PARTIAL'} "
-        f"best_no_proxy={best_no_proxy} "
+        f"single_method_sequential={'PASS' if sequential_method_pass else 'PARTIAL'} "
+        f"comparative_claim_available={comparative_claim_available} "
+        f"best_no_proxy={best_no_proxy or 'none'} "
         f"expansion_needed={expansion_needed} "
         f"expanded_beats_fixed={expanded_beats_fixed} "
         f"no_proxy_retention_rescue={no_proxy_retention_rescue} "
@@ -2100,11 +2192,13 @@ def summarize_verdict(
         "final_verdict",
         stress_test_pass=stress_test_pass,
         paper_ready=paper_ready,
+        single_method_sequential_pass=sequential_method_pass,
+        comparative_claim_available=comparative_claim_available,
         best_no_proxy=best_no_proxy,
         expansion_needed=expansion_needed,
         expanded_beats_fixed=expanded_beats_fixed,
-        no_proxy_retention_beats_sdft=no_proxy_beats_sdft_retention,
-        no_proxy_retention_beats_naive=no_proxy_beats_naive_retention,
+        no_proxy_retention_beats_sdft=bool("sdft_baseline" in baseline_labels and any(beats_retention(label, "sdft_baseline") for label in no_proxy_labels)),
+        no_proxy_retention_beats_naive=bool("naive_sft" in baseline_labels and any(beats_retention(label, "naive_sft") for label in no_proxy_labels)),
         no_proxy_retention_rescue=no_proxy_retention_rescue,
         no_proxy_new_task_competitive=no_proxy_new_task_competitive,
         ppl_rescue_pass=ppl_rescue_pass,
@@ -2129,6 +2223,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="Use tiny synthetic tasks for plumbing only")
+    parser.add_argument(
+        "--d-variants",
+        default="all",
+        help=(
+            "Comma-separated final D branches to run. Use all, or any of: "
+            "naive_sft, sdft_baseline, fixed_no_proxy, expanded_no_proxy. "
+            "Aliases: naive, sdft, fixed, expanded."
+        ),
+    )
 
     parser.add_argument("--skip-preflight", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
