@@ -91,7 +91,7 @@ The exact long-form commands used during research changed across runs. See `EXPE
 
 ## Scope
 
-This repo does not claim that continual learning is solved universally.
+This repo does not claim that continual learning is solved universally YET.
 
 It provides evidence that replay-free skill retention is possible in these tested Qwen/Gemma settings, and that gradient geometry can be used as a control surface for continual learning.
 
