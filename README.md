@@ -1,4 +1,4 @@
-# Eigenesis Continual Learning
+# Continual Learning
 
 Research scripts for replay-free continual learning experiments on small pretrained language models.
 
