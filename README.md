@@ -19,6 +19,8 @@ The current answer is scoped but real:
 - Z-Tomography measures layer pressure and occupied/free geometry.
 - Amoeba consolidation uses same-batch old-checkpoint anchoring plus gradient projection.
 
+Artcile: https://x.com/eigengenesis/status/2053855070551437495?s=20
+
 ## Repository Map
 
 | file | purpose |
