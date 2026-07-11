@@ -30,7 +30,9 @@ jobs:
             tests/test_structural_thermodynamics.py \
             tests/test_qwen35_five_skill_manifest.py \
             tests/test_qwen35_lifelong_pipeline.py \
-            tests/test_supervised_batch_boundary.py
+            tests/test_supervised_batch_boundary.py \
+            tests/test_continual_engine.py \
+            tests/test_continual_stage1_adapter.py
       - name: Build distributions
         run: |
           python -m build

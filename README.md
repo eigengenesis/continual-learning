@@ -1,103 +1,178 @@
 # Eigenesis Continual Learning
 
-Research scripts for replay-free continual learning experiments on small pretrained language models.
+Research code for replay-free, in-weights continual learning in small language
+models. The project studies whether new capabilities can be acquired and
+consolidated without replaying historical task data or catastrophically
+overwriting previously learned behavior.
 
-This repo is a research artifact, not a polished library. The scripts are intentionally close to the experiments: they train adapter teachers, collect layerwise tomography, project gradients away from occupied subspaces, consolidate skills with old-checkpoint anchors, and benchmark against naive SFT / SDFT-style baselines.
+The current system combines temporary skill acquisition, layerwise geometric
+profiling, occupied-subspace projection, old-checkpoint anchoring, selective
+profile release, and transactional model commits.
 
-## Article
+## Research Status
 
-Public writeup:
+This repository contains two complementary implementations:
 
-https://x.com/eigengenesis/status/2053855070551437495
+1. A stage-aware experimental runner used to develop and audit the mechanism.
+2. A task-agnostic, event-driven continual-learning engine intended to turn the
+   mechanism into a coherent long-running system.
 
-## What This Tests
+The codebase has local unit and integration coverage. Reported Qwen and Gemma
+results are scoped to the configurations documented in [EXPERIMENTS.md](EXPERIMENTS.md).
+The event-driven Hugging Face backend is implemented and locally contract-tested;
+its complete two-T4 scientific run remains pending. This repository does not
+claim that continual learning is solved generally.
 
-The core question:
+## Core Method
 
-> Can a model learn a new skill without replaying old task data and without catastrophically destroying the old skill?
+For each learning event, the system:
 
-The current answer is scoped but real:
+1. Acquires the new behavior in a temporary adapter policy from demonstrations,
+   verifier rewards, or both.
+2. Measures update pressure, overlap with protected profiles, occupied rank,
+   and residual update energy across model layers.
+3. Produces an immutable geometry plan that protects active capabilities and,
+   for explicit revisions, releases only superseded profiles plus their
+   dependency closure.
+4. Consolidates the temporary policy into a candidate model using new-policy
+   alignment, old-checkpoint anchoring, and occupied-gradient projection.
+5. Commits the candidate atomically only after capability, retention, general,
+   staleness, numerical, access, and budget gates pass.
 
-- Qwen 0.5B no-proxy continual learning works on staged synthetic skills.
-- Gemma 270M shows the same replay-free pattern after interface calibration.
-- Alien Ladder stress tests SCAN -> COGS -> GeoQuery against SFT and SDFT.
-- Z-Tomography measures layer pressure and occupied/free geometry.
-- Amoeba consolidation uses same-batch old-checkpoint anchoring plus gradient projection.
+Acquisition never mutates the committed model. Rejected events retain their
+audit records but cannot advance the serving checkpoint.
 
-## Repository Map
+## Repository Structure
 
-| file | purpose |
+| Path | Purpose |
 | --- | --- |
-| `alien_ladder_cl_audit.py` | Main stress test: SCAN -> COGS -> GeoQuery, comparing naive SFT, SDFT baseline, fixed no-proxy, and expanded no-proxy. |
-| `qwen_cl_desiderata_audit.py` | Focused Qwen no-proxy continual-learning audit: adapter acquisition, Amoeba consolidation, projection, LSP composition branches. |
-| `qwen_continual_proof.py` | Earlier large Qwen pipeline with staged synthetic skills, consolidation, composition, and expansion experiments. |
-| `gemma_cl_desiderata_audit.py` | Cross-family Gemma 270M no-proxy audit with Gemma-calibrated task interface. |
-| `gsm8k_sdft_baseline_audit.py` | GSM8K -> Sort retention/acquisition comparison against naive SFT and SDFT-style baseline. |
-| `qwen_z_law_controller_audit.py` | Qwen Z-law / Z-guided expansion audit for conflict pressure and adaptive capacity growth. |
-| `qwen_tomography.py` | Layerwise activation/gradient SVD profiles, occupied bases, pressure scoring, layer selection, saturation reports. |
-| `standalone_latent_lora_qwen.py` | Shared model loading, latent adapter, LoRA-style modules, schedules, and utility code. |
-| `EXPERIMENTS.md` | Human-readable experiment summaries and safest public claims. |
+| `src/chaos/continual/` | Event contracts, verifier plugins, grouped on-policy acquisition, geometry control, consolidation, durable streams, and atomic commit/rollback. |
+| `qwen35_lifelong_pipeline.py` | Resumable Stage-1 reference lifecycle: primitive acquisition, composition, policy revision, selective release, and final audit. |
+| `qwen35_five_skill_cl_audit.py` | Frozen-manifest SFT, SDFT, OP-SDFT, and Amoeba comparison runner. |
+| `alien_ladder_cl_audit.py` | SCAN -> COGS -> GeoQuery stress test and shared consolidation utilities. |
+| `qwen_tomography.py` | Layerwise activation/gradient SVD profiles, pressure scoring, and saturation reports. |
+| `standalone_latent_lora_qwen.py` | Shared latent-adapter implementation and model utilities. |
+| `src/chaos/` | Installable thermodynamic training-control library used by the broader Eigenesis work. |
+| `docs/continual_pipeline.md` | Event-engine architecture, invariants, artifact layout, and exact two-T4 runbook. |
+| `tests/` | Unit, privacy, interruption, recovery, access-control, geometry, and end-to-end transaction tests. |
 
-## Quick Sanity Check
+Earlier Qwen/Gemma audits remain in the repository as research history and
+cross-checks. They are not the primary orchestration interface.
 
-This only checks that the scripts import and compile:
+## Installation
 
-```bash
-python -m py_compile \
-  standalone_latent_lora_qwen.py \
-  qwen_tomography.py \
-  qwen_continual_proof.py \
-  qwen_cl_desiderata_audit.py \
-  gemma_cl_desiderata_audit.py \
-  gsm8k_sdft_baseline_audit.py \
-  qwen_z_law_controller_audit.py \
-  alien_ladder_cl_audit.py
-```
-
-## Install
-
-Use a GPU environment. The largest experiments were run with CUDA and `bfloat16`.
+For local development:
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip install -e ".[dev]"
 ```
 
-Optional but recommended:
+For the Hugging Face continual-learning runtime:
 
 ```bash
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+python -m pip install -e ".[dev,rl,viz]"
 ```
 
-## Main Run
+Qwen 3.5 may require a recent Transformers build. The validated Kaggle setup and
+dependency preflight are documented in [docs/continual_pipeline.md](docs/continual_pipeline.md).
 
-The flagship script is:
+## Validation
+
+Run the local suite:
 
 ```bash
-python -u alien_ladder_cl_audit.py \
-  --device cuda \
-  --dtype bfloat16 \
-  --seed 1337
+python -m pytest -q
+python -m py_compile src/chaos/continual/*.py
+chaos-continual --help
 ```
 
-The exact long-form commands used during research changed across runs. See `EXPERIMENTS.md` for the result summaries and interpretation.
+The suite covers, among other invariants:
 
-## Core Ideas
+- verifier-private targets do not enter optimizer-visible metadata;
+- grouped rollouts retain successes, failures, invalid outputs, and errors;
+- generated token IDs are not silently changed by decode/re-tokenize cycles;
+- historical committed training rows cannot be replayed into later updates;
+- explicit revision release follows profile dependency closure;
+- interrupted acquisition resumes from matching policy, optimizer, RNG, and
+  ledger state;
+- a failed event leaves the current model pointer unchanged;
+- orphaned versions and pointer-published transactions recover safely.
 
-- **Z-Tomography**: scan layers using activation and gradient geometry to estimate pressure, occupancy, and free capacity.
-- **Occupied-manifold projection**: remove update components that point through old-skill geometry.
-- **Amoeba consolidation**: consolidate a new teacher into the base model using only the new-task batch while an old checkpoint anchors behavior and hidden geometry.
-- **Lateral Skill Propagation**: compose already-learned skills through scaffolded traces, then distill the composition into one forward pass.
-- **Expansion gating**: grow capacity when fixed model geometry is crowded.
+## Event-Driven Engine
 
-## Scope
+The CLI exposes a durable event queue and a single evolving model store:
 
-This repo does not claim that continual learning is solved universally YET.
+```bash
+chaos-continual init --runtime hf --store "$STORE" --model "$MODEL"
+chaos-continual submit --events "$EVENTS" --event event.json
+chaos-continual run --runtime hf --store "$STORE" --events "$EVENTS" \
+  --device cuda:0 --teacher-device cuda:1 --dtype float32 \
+  --general-canary general_canary.json
+chaos-continual status --store "$STORE" --events "$EVENTS"
+chaos-continual audit --store "$STORE"
+```
 
-It provides evidence that replay-free skill retention is possible in these tested Qwen/Gemma settings, and that gradient geometry can be used as a control surface for continual learning.
+Frozen Stage-1 and historical-skill manifests can be converted into generic
+events with `stage1-events` and `history-events`. See the full
+[continual pipeline runbook](docs/continual_pipeline.md) before starting a GPU
+run; it includes the required base-general profile, dependency ordering,
+checkpoint layout, and resume procedure.
 
-## Citation / Contact
+## Stage-1 Reference
 
-If you use these scripts or ideas, please cite/link the repo:
+The legacy runner remains available as a regression fixture and mechanism
+audit. It freezes its manifest and hyperparameters before training:
+
+```bash
+python -u qwen35_lifelong_pipeline.py \
+  --mode build_manifest \
+  --model-id "$MODEL" \
+  --history-manifest "$HISTORY" \
+  --manifest-path "$PIPELINE/manifest.json"
+
+python -u qwen35_lifelong_pipeline.py \
+  --mode run \
+  --model-id "$MODEL" \
+  --history-manifest "$HISTORY" \
+  --manifest-path "$PIPELINE/manifest.json" \
+  --output-dir "$PIPELINE" \
+  --device cuda:0 \
+  --teacher-device cuda:1 \
+  --dtype float32 \
+  --resume auto
+```
+
+Use `--stop-after <stage>` to divide the lifecycle across bounded notebook
+sessions. Starting the same command with `--resume auto` verifies committed
+stage hashes and restores an interrupted stage from its latest valid snapshot.
+
+## Reproducibility Principles
+
+- Manifests, dataset rows, seeds, verifier configurations, and gates are
+  fingerprinted before training.
+- Reward-only targets remain verifier-private and gold rollout rescue is
+  disabled.
+- Access logs record every row used for an update.
+- General and historical canaries are evaluation/profile data, never replay
+  batches.
+- `current.json` is the publication boundary for the model store and is updated
+  only after candidate artifacts and checksums are complete.
+- Changed configurations are new event revisions; failed gates are not silently
+  weakened and retried.
+
+## Background
+
+The initial public writeup predates the transactional engine and records the
+development path that led to this repository:
+[Replay-Free Continual Learning](https://x.com/eigengenesis/status/2053855070551437495).
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
+
+## Citation
+
+Until a formal paper citation is available, cite the repository:
 
 ```text
 Eigenesis Continual Learning
