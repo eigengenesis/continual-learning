@@ -1,0 +1,8 @@
+include README.md
+include LICENSE
+recursive-include src *.py
+recursive-include docs *.md
+recursive-exclude benchmarks *
+include benchmarks/data/tiny_corpus.txt
+include benchmarks/data/sft_tiny.jsonl
+include benchmarks/data/dpo_tiny.jsonl

@@ -4,11 +4,19 @@ __pycache__/
 .ipynb_checkpoints/
 .pytest_cache/
 .colab_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Large/generated artifacts
 outputs/
 results/
 checkpoints/
+build/
+dist/
+*.egg-info/
+*.log
 *.pt
 *.pth
 *.safetensors
@@ -23,4 +31,3 @@ shakespeare.txt
 .venv/
 venv/
 env/
-
