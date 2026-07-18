@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chaos"
+version = "0.1.0"
+description = "Z0 thermodynamic control for gradient-based optimization"
+readme = "README.md"
+authors = [
+  { name = "Swapnil" },
+]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["optimization", "thermodynamics", "z0", "sft", "pytorch"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.20.0",
+]
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+pre = [
+    "transformers>=4.40",
+    "datasets>=2.18",
+    "tokenizers>=0.15",
+]
+sft = [
+    "transformers>=4.40",
+    "datasets>=2.18",
+    "peft>=0.10",
+    "trl>=0.8",
+]
+dpo = [
+    "transformers>=4.40",
+    "datasets>=2.18",
+    "peft>=0.10",
+    "trl>=0.8",
+]
+rl = [
+    "transformers>=4.40",
+    "datasets>=2.18",
+    "tokenizers>=0.15",
+    "safetensors>=0.8.0",
+    "trl>=0.8",
+]
+nlp = [
+    "transformers>=4.40",
+]
+viz = [
+    "matplotlib>=3.7",
+]
+dev = [
+    "pytest>=8",
+    "matplotlib>=3.7",
+    "safetensors>=0.8.0",
+]
+release = [
+    "build>=1.0",
+    "twine>=5.0",
+]
+bench = [
+    "matplotlib>=3.7",
+    "transformers>=4.40",
+    "datasets>=2.18",
+    "tokenizers>=0.15",
+    "peft>=0.10",
+    "trl>=0.8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[project.scripts]
+chaos-continual = "chaos.continual.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

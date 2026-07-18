@@ -324,6 +324,12 @@ class ArtifactLogger:
             "extra_json",
         ]
         self.summary_rows: List[Dict[str, Any]] = []
+        if self.summary_path.exists():
+            try:
+                with self.summary_path.open("r", newline="", encoding="utf-8") as handle:
+                    self.summary_rows = list(csv.DictReader(handle))
+            except Exception:
+                self.summary_rows = []
         self._init_csv(self.curves_path, self.curve_fields)
         self._init_csv(
             self.z_path,
@@ -1061,7 +1067,7 @@ def train_adapter_teacher(
     params = qp._trainable_params(model)
     if not params:
         raise RuntimeError(f"{stage}: no trainable params after attaching LoRA")
-    optimizer = torch.optim.AdamW(params, lr=float(lr))
+    optimizer = torch.optim.AdamW(params, lr=float(lr), foreach=False)
     if cfg.device.startswith("cuda"):
         qp._configure_gradient_checkpointing(model, cfg.gradient_checkpointing)
     batch_fn = task.make_batch(tokenizer, cfg.device, cfg.batch_size, cfg.max_seq_len, cfg.seed + stable_seed(stage, 3100))
@@ -1141,7 +1147,7 @@ def consolidate_no_proxy(
     teacher_old.to(teacher_device)
     teacher_new.to(teacher_device)
     params = _trainable_full_student(student, cfg)
-    optimizer = torch.optim.AdamW(params, lr=float(lr))
+    optimizer = torch.optim.AdamW(params, lr=float(lr), foreach=False)
     batch_fn = task.make_batch(tokenizer, cfg.device, cfg.batch_size, cfg.max_seq_len, cfg.seed + stable_seed(stage, 4100))
     start = time.time()
     student.train()
@@ -1232,7 +1238,7 @@ def consolidate_naive(
     lr: float,
 ) -> Dict[str, float]:
     params = _trainable_full_student(student, cfg)
-    optimizer = torch.optim.AdamW(params, lr=float(lr))
+    optimizer = torch.optim.AdamW(params, lr=float(lr), foreach=False)
     batch_fn = task.make_batch(tokenizer, cfg.device, cfg.batch_size, cfg.max_seq_len, cfg.seed + stable_seed(stage, 5100))
     start = time.time()
     student.train()
@@ -1265,8 +1271,17 @@ def _prompts_from_supervised_batch(tokenizer, batch: Dict[str, torch.Tensor]) ->
     for row_idx in range(input_ids.shape[0]):
         mask = labels[row_idx] == -100
         prompt_len = int(mask.sum().item())
-        prompt_ids = input_ids[row_idx, :prompt_len]
-        prompts.append(tokenizer.decode(prompt_ids, skip_special_tokens=False))
+        if prompt_len <= 0:
+            # Very long targets can consume the whole supervised sequence. Keep
+            # on-policy generation from handing an empty prompt to decoder-only
+            # models, which can crash some Qwen3.5 linear-attention paths.
+            attention_mask = batch.get("attention_mask")
+            valid_len = int(attention_mask[row_idx].sum().item()) if attention_mask is not None else int(input_ids.shape[1])
+            prompt_ids = input_ids[row_idx, : max(1, min(valid_len, 1))]
+        else:
+            prompt_ids = input_ids[row_idx, :prompt_len]
+        prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=False).strip()
+        prompts.append(prompt_text if prompt_text else (tokenizer.bos_token or tokenizer.eos_token or " "))
     return prompts
 
 
@@ -1284,6 +1299,7 @@ def generate_on_policy_completions(
 ) -> List[str]:
     if not prompts:
         return []
+    prompts = [prompt if str(prompt).strip() else (tokenizer.bos_token or tokenizer.eos_token or " ") for prompt in prompts]
     original_padding_side = getattr(tokenizer, "padding_side", "right")
     if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -1306,12 +1322,97 @@ def generate_on_policy_completions(
     }
     if do_sample:
         kwargs.update({"temperature": float(temperature), "top_p": float(top_p)})
-    outputs = model.generate(**inputs, **kwargs)
+    with torch.backends.cudnn.flags(enabled=False):
+        outputs = model.generate(**inputs, **kwargs)
     prompt_width = int(inputs["input_ids"].shape[1])
     return [
         tokenizer.decode(outputs[row_idx, prompt_width:], skip_special_tokens=True).strip()
         for row_idx in range(len(prompts))
     ]
+
+
+def _prepare_completion_kl_batch(
+    tokenizer,
+    prompts: Sequence[str],
+    completions: Sequence[str],
+    device: str,
+    max_length: int,
+) -> Dict[str, torch.Tensor]:
+    """Prepare fixed-width prompt+completion inputs with completion masks.
+
+    Student and teacher prompts can have different lengths, but the same
+    completion is right-aligned in both batches. This lets us compare their
+    per-token distributions over completion positions only.
+    """
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    if pad_id is None:
+        pad_id = 0
+    eos_id = tokenizer.eos_token_id
+    rows: List[List[int]] = []
+    masks: List[List[int]] = []
+    comp_masks: List[List[int]] = []
+    fixed_len = max(2, int(max_length))
+    for prompt, completion in zip(prompts, completions):
+        prompt_ids = tokenizer(str(prompt), add_special_tokens=False)["input_ids"]
+        completion_ids = tokenizer(str(completion), add_special_tokens=False)["input_ids"]
+        if not completion_ids:
+            completion_ids = [int(eos_id if eos_id is not None else pad_id)]
+        if len(completion_ids) >= fixed_len:
+            completion_ids = completion_ids[:fixed_len]
+            prompt_tail: List[int] = []
+        else:
+            budget = fixed_len - len(completion_ids)
+            prompt_tail = prompt_ids[-budget:] if budget else []
+        ids = prompt_tail + completion_ids
+        token_mask = [1] * len(ids)
+        completion_mask = [0] * len(prompt_tail) + [1] * len(completion_ids)
+        pad_len = fixed_len - len(ids)
+        rows.append([int(pad_id)] * pad_len + ids)
+        masks.append([0] * pad_len + token_mask)
+        comp_masks.append([0] * pad_len + completion_mask)
+    return {
+        "input_ids": torch.tensor(rows, dtype=torch.long, device=device),
+        "attention_mask": torch.tensor(masks, dtype=torch.long, device=device),
+        "completion_mask": torch.tensor(comp_masks, dtype=torch.long, device=device),
+    }
+
+
+def _completion_forward_kl_loss(student_outputs, teacher_outputs, student_completion_mask: torch.Tensor) -> torch.Tensor:
+    student_logits = student_outputs.logits[:, :-1, :]
+    teacher_logits = teacher_outputs.logits[:, :-1, :].to(device=student_logits.device, dtype=student_logits.dtype)
+    mask = student_completion_mask[:, 1:].to(device=student_logits.device, dtype=student_logits.dtype)
+    if not torch.any(mask > 0):
+        return student_logits.sum() * 0.0
+    student_logps = F.log_softmax(student_logits, dim=-1)
+    teacher_logps = F.log_softmax(teacher_logits, dim=-1)
+    per_vocab = F.kl_div(student_logps, teacher_logps, reduction="none", log_target=True)
+    per_token = per_vocab.sum(dim=-1)
+    return (per_token * mask).sum() / mask.sum().clamp(min=1.0)
+
+
+def _demo_conditioned_teacher_prompt(prompt: str, target: str) -> str:
+    return (
+        f"{str(prompt).strip()}\n\n"
+        "This is an example for a response to the question:\n"
+        f"{str(target).strip()}\n\n"
+        "Now answer with a response of your own, including the thinking process.\n"
+    )
+
+
+def _sample_task_texts(task: TaskData, seed: int, step: int, batch_size: int) -> Tuple[List[str], List[str]]:
+    rng = np.random.default_rng(seed + 7919 * int(step))
+    idxs = rng.integers(0, len(task.train), size=int(batch_size))
+    prompts = [task.train[int(i)].prompt for i in idxs]
+    targets = [task.train[int(i)].target for i in idxs]
+    return prompts, targets
+
+
+def _sync_ref_model(student, ref_model, alpha: float) -> None:
+    with torch.no_grad():
+        for student_param, ref_param in zip(student.parameters(), ref_model.parameters()):
+            ref_param.data.mul_(1.0 - float(alpha)).add_(student_param.data.to(ref_param.device), alpha=float(alpha))
 
 
 def sdft_forward_kl_loss(student_outputs, teacher_outputs, labels: torch.Tensor) -> torch.Tensor:
@@ -1352,32 +1453,14 @@ def consolidate_sdft(
     qp._freeze_model(teacher_new)
     teacher_new.to(teacher_device)
     params = _trainable_full_student(student, cfg)
-    optimizer = torch.optim.AdamW(params, lr=float(lr))
+    optimizer = torch.optim.AdamW(params, lr=float(lr), foreach=False)
     batch_fn = task.make_batch(tokenizer, cfg.device, cfg.batch_size, cfg.max_seq_len, cfg.seed + stable_seed(stage, 6100))
     eos = tokenizer.eos_token or ""
     start = time.time()
     for step in range(1, int(steps) + 1):
-        batch = batch_fn(step)
-        student.eval()
-        with torch.no_grad():
-            prompts = _prompts_from_supervised_batch(tokenizer, batch)
-            completions = generate_on_policy_completions(
-                student,
-                tokenizer,
-                prompts,
-                cfg.device,
-                max_new_tokens=task.spec.max_new_tokens,
-                do_sample=do_sample,
-                temperature=temperature,
-                top_p=top_p,
-            )
-        sdft_batch = qp._prepare_supervised_batch(
-            tokenizer,
-            prompts,
-            [truncate_completion(text) + eos for text in completions],
-            cfg.device,
-            cfg.max_seq_len,
-        )
+        # Teacher-forced SDFT avoids brittle decoder generation paths while
+        # still distilling the frozen task teacher on the active task tokens.
+        sdft_batch = batch_fn(step)
         student.train()
         optimizer.zero_grad(set_to_none=True)
         split = qp._split_tensor_batch(sdft_batch, cfg.consolidation_micro_batch_size)
@@ -1398,14 +1481,130 @@ def consolidate_sdft(
         if step % cfg.log_interval == 0 or step == steps:
             print(
                 f"[{stage}] step={step:04d}/{steps} loss={loss_value:.4f} "
-                f"method=on_policy_sdft loss_type={loss_type} protection=none "
+                f"method=teacher_forced_sdft loss_type={loss_type} protection=none "
                 f"old_task_examples=0 proxy_batches=0",
                 flush=True,
             )
-            logger.log_curve(stage, step, loss=loss_value, old_task_examples=0, proxy_batches=0, sdft_loss_type=loss_type)
+            logger.log_curve(
+                stage,
+                step,
+                loss=loss_value,
+                old_task_examples=0,
+                proxy_batches=0,
+                method="teacher_forced_sdft",
+                sdft_loss_type=loss_type,
+            )
     metrics = evaluate_suite(student, tokenizer, active_eval_tasks, cfg, do_generation=True, include_wikitext=True)
     print_metrics(stage, metrics, [t.spec.name for t in active_eval_tasks])
-    logger.log_stage_summary(stage, metrics, wall_time_sec=time.time() - start, old_task_examples=0, proxy_batches=0, method="sdft")
+    logger.log_stage_summary(
+        stage,
+        metrics,
+        wall_time_sec=time.time() - start,
+        old_task_examples=0,
+        proxy_batches=0,
+        method="teacher_forced_sdft",
+    )
+    print(f"[{stage}] wall_time_sec={time.time() - start:.1f}", flush=True)
+    return metrics
+
+
+def consolidate_on_policy_demo_sdft(
+    *,
+    student,
+    ref_model,
+    tokenizer,
+    task: TaskData,
+    active_eval_tasks: Sequence[TaskData],
+    cfg: qp.RuntimeConfig,
+    logger: ArtifactLogger,
+    stage: str,
+    steps: int,
+    lr: float,
+    teacher_device: str,
+    do_sample: bool,
+    temperature: float,
+    top_p: float,
+    ref_model_mixup_alpha: float,
+    ref_model_sync_steps: int,
+) -> Dict[str, float]:
+    """Shen et al.-style on-policy demo-conditioned SDFT baseline.
+
+    The student generates completions from the ordinary prompt. The frozen /
+    slowly-synced reference model scores the same completion tokens under a
+    demonstration-conditioned teacher prompt that contains the gold response.
+    The student is trained with per-token forward KL on completion positions.
+    """
+    qp._freeze_model(ref_model)
+    ref_model.to(teacher_device)
+    params = _trainable_full_student(student, cfg)
+    optimizer = torch.optim.AdamW(params, lr=float(lr), foreach=False)
+    eos = tokenizer.eos_token or ""
+    start = time.time()
+    for step in range(1, int(steps) + 1):
+        prompts, targets = _sample_task_texts(task, cfg.seed + stable_seed(stage, 6200), step, cfg.batch_size)
+        student.eval()
+        with torch.no_grad():
+            completions = generate_on_policy_completions(
+                student,
+                tokenizer,
+                prompts,
+                cfg.device,
+                max_new_tokens=task.spec.max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+            )
+        completions = [truncate_completion(text) + eos for text in completions]
+        teacher_prompts = [_demo_conditioned_teacher_prompt(prompt, target) for prompt, target in zip(prompts, targets)]
+        student_batch = _prepare_completion_kl_batch(tokenizer, prompts, completions, cfg.device, cfg.max_seq_len)
+        teacher_batch = _prepare_completion_kl_batch(tokenizer, teacher_prompts, completions, teacher_device, cfg.max_seq_len)
+
+        student.train()
+        optimizer.zero_grad(set_to_none=True)
+        outputs = student(
+            input_ids=student_batch["input_ids"],
+            attention_mask=student_batch["attention_mask"],
+            use_cache=False,
+        )
+        with torch.no_grad():
+            teacher_outputs = ref_model(
+                input_ids=teacher_batch["input_ids"],
+                attention_mask=teacher_batch["attention_mask"],
+                use_cache=False,
+            )
+        loss = _completion_forward_kl_loss(outputs, teacher_outputs, student_batch["completion_mask"])
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
+        optimizer.step()
+        if int(ref_model_sync_steps) > 0 and step % int(ref_model_sync_steps) == 0:
+            _sync_ref_model(student, ref_model, float(ref_model_mixup_alpha))
+        if step % cfg.log_interval == 0 or step == steps:
+            loss_value = float(loss.item())
+            print(
+                f"[{stage}] step={step:04d}/{steps} loss={loss_value:.4f} "
+                "method=on_policy_demo_sdft loss_type=forward_kl protection=none "
+                "old_task_examples=0 proxy_batches=0",
+                flush=True,
+            )
+            logger.log_curve(
+                stage,
+                step,
+                loss=loss_value,
+                old_task_examples=0,
+                proxy_batches=0,
+                method="on_policy_demo_sdft",
+                sdft_loss_type="forward_kl",
+            )
+    metrics = evaluate_suite(student, tokenizer, active_eval_tasks, cfg, do_generation=True, include_wikitext=True)
+    print_metrics(stage, metrics, [t.spec.name for t in active_eval_tasks])
+    logger.log_stage_summary(
+        stage,
+        metrics,
+        wall_time_sec=time.time() - start,
+        old_task_examples=0,
+        proxy_batches=0,
+        method="on_policy_demo_sdft",
+    )
     print(f"[{stage}] wall_time_sec={time.time() - start:.1f}", flush=True)
     return metrics
 
@@ -1427,6 +1626,17 @@ def print_metrics(label: str, metrics: Dict[str, float], task_names: Sequence[st
 def checkpoint_model(model, tokenizer, out_dir: Path, stage: str, policy: str, metadata: Dict[str, Any]) -> Optional[Path]:
     if policy == "none":
         return None
+    if policy == "final_pretrained":
+        if stage != "final":
+            return None
+        policy = "pretrained"
+    if policy == "final_state":
+        if stage != "final":
+            return None
+        policy = "state"
+    if policy not in {"state", "pretrained"}:
+        raise ValueError(f"unknown checkpoint policy: {policy}")
+
     stage_dir = out_dir / "checkpoints" / stage
     stage_dir.mkdir(parents=True, exist_ok=True)
     with (stage_dir / "metadata.json").open("w", encoding="utf-8") as handle:
@@ -2327,7 +2537,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--eval-interval", type=int, default=200)
     parser.add_argument("--log-interval", type=int, default=100)
-    parser.add_argument("--checkpoint-policy", choices=("none", "state", "pretrained"), default="state")
+    parser.add_argument(
+        "--checkpoint-policy",
+        choices=("none", "state", "pretrained", "final_state", "final_pretrained"),
+        default="state",
+    )
     parser.add_argument("--max-ppl-ratio", type=float, default=1.12)
     return parser
 
