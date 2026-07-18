@@ -1,4 +1,4 @@
-# Eigenesis Continual Learning
+# Continual Learning
 
 Research code for replay-free, in-weights continual learning in small language
 models. The project studies whether new capabilities can be acquired and
